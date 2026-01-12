@@ -2,6 +2,20 @@
 
 #include <Adafruit_NeoPixel.h>
 
+// -----------------------------
+// Zipper (variable resistor)
+// -----------------------------
+const int ZIPPER_PIN = A2;
+
+// Calibration (from your measurements)
+const int ZIPPER_CLOSED = 850;   // fully closed → bright
+const int ZIPPER_OPEN   = 990;   // fully open   → dark
+
+// Noise handling
+const float ALPHA = 0.15;   // EMA smoothing factor
+const int DEADBAND = 3;     // ADC counts
+
+
 /////////////////////
 // LED Segments    //
 /////////////////////
@@ -13,23 +27,28 @@ struct LedSegment {
 };
 
 enum SegmentID {
+  HAZARD_LIGHTS,
   TURN_RIGHT,
   TURN_LEFT,
-  HAZARD_LIGHTS
 };
 
 const LedSegment LED_SEGMENTS[] = {
-  { 0,  6, false },  // LEDs 1–6
-  { 7, 14, true  },  // LEDs 7–12
-  {15, 40, true  }   // LEDs 13–30
+  { 0, 23, true  },   // LEDs 13–30
+  { 24, 30, false },  // LEDs 1–6
+  { 31, 37, true  },  // LEDs 7–12
 };
+
+constexpr uint8_t LED_RIGHT_INDICATOR  = 38;
+constexpr uint8_t LED_HAZARD_INDICATOR = 39;
+constexpr uint8_t LED_LEFT_INDICATOR   = 40;
+
 
 /////////////////////
 // NeoPixel config //
 /////////////////////
 
-constexpr uint8_t PIN = 6;
-constexpr uint16_t NUM_LEDS = 46;
+constexpr uint8_t PIN = 4;
+constexpr uint16_t NUM_LEDS = 41;
 
 Adafruit_NeoPixel strip(NUM_LEDS, PIN, NEO_GRB + NEO_KHZ800);
 
@@ -37,8 +56,8 @@ Adafruit_NeoPixel strip(NUM_LEDS, PIN, NEO_GRB + NEO_KHZ800);
 //    Constants    //
 /////////////////////
 
-const int CAP_THRESHOLD = 200;
-const int RES_THRESHOLD = 150;
+const int CAP_THRESHOLD = 500;
+const int RES_THRESHOLD = 250;
 
 const unsigned long CROSS_WINDOW   = 1000;
 const unsigned long WIPE_STEP_TIME = 80;
@@ -76,8 +95,8 @@ struct ZPatch {
     : pinA(a), pinB(b) {}
 };
 
-ZPatch patch1{ A0, A1 };
-ZPatch patch2{ A2, A3 };
+ZPatch patch1{ A6, A7 };
+ZPatch patch2{ A4, A5 };
 
 struct CrossDetector {
   bool pending = false;
@@ -131,9 +150,11 @@ void loop() {
   loopCount++;
 
   unsigned long now = millis();
-
+  uint8_t brightness = readZipperBrightness();
+  strip.setBrightness(brightness);
   updateWipeAnimation();   // affects 1–12 only
   updateHazardLights();    // affects 13–30 only
+  
 
   updateSensor(patch1);
   updateSensor(patch2);
@@ -144,7 +165,7 @@ void loop() {
     patch2.baseline += patch2.capValue;
   }
 
-  if (resistiveHeld(patch1, now)) {
+  if (resistiveHeld(patch2, now)) {
     hazardActive = !hazardActive;
     clearStripPart(LED_SEGMENTS[HAZARD_LIGHTS].start, LED_SEGMENTS[HAZARD_LIGHTS].end);
   }
@@ -257,6 +278,8 @@ void updateWipeAnimation()
   // Mark expiration but allow loop to finish
   if (!animation.finishing && now > animation.until) {
     animation.finishing = true;
+    strip.setPixelColor(LED_RIGHT_INDICATOR, strip.Color(0, 0, 0));
+    strip.setPixelColor(LED_LEFT_INDICATOR, strip.Color(0, 0, 0));
   }
 
   // End only at loop boundary
@@ -264,6 +287,8 @@ void updateWipeAnimation()
     animation.active = false;
     animation.finishing = false;
     clearStripPart(animation.start, animation.end);
+    strip.setPixelColor(LED_RIGHT_INDICATOR, strip.Color(0, 0, 0));
+    strip.setPixelColor(LED_LEFT_INDICATOR, strip.Color(0, 0, 0));
     return;
   }
 
@@ -281,8 +306,9 @@ void updateWipeAnimation()
     b = animation.end - ((step + 1) % length);
   }
 
-  strip.setPixelColor(a, strip.Color(0, 0, 255));
-  strip.setPixelColor(b, strip.Color(0, 0, 255));
+  strip.setPixelColor(a, strip.Color(255, 60, 0));
+  strip.setPixelColor(b, strip.Color(255, 60, 0));
+  updateTurnIndicatorLeds();
   strip.show();
 }
 
@@ -290,9 +316,11 @@ void updateWipeAnimation()
 void updateHazardLights() {
   const LedSegment& seg = LED_SEGMENTS[HAZARD_LIGHTS];
   
-  // clear and leave function
-  if (!hazardActive) return;
-  
+  if (!hazardActive) {
+    strip.setPixelColor(LED_HAZARD_INDICATOR, 0);
+    strip.show();
+    return;
+  }
 
   unsigned long now = millis();
   if (now - hazardLastToggle < HAZARD_BLINK_INTERVAL) return;
@@ -300,16 +328,40 @@ void updateHazardLights() {
 
   hazardPhase = !hazardPhase;
 
+  uint32_t color = hazardPhase ? strip.Color(255, 5, 0) : 0;
 
   for (int i = seg.start; i <= seg.end; i++) {
-    strip.setPixelColor(
-      i,
-      hazardPhase ? strip.Color(255, 50, 0) : 0
-    );
+    strip.setPixelColor(i, color);
   }
+
+  // 🔴 extra hazard LED
+  strip.setPixelColor(LED_HAZARD_INDICATOR, color);
 
   strip.show();
 }
+
+void updateTurnIndicatorLeds() {
+  uint32_t off = 0;
+
+  strip.setPixelColor(LED_RIGHT_INDICATOR, off);
+  strip.setPixelColor(LED_LEFT_INDICATOR,  off);
+
+  if (!animation.active) return;
+
+  // reuse hazard blink timing for consistency
+  bool blinkOn = (millis() / HAZARD_BLINK_INTERVAL) % 2;
+  if (!blinkOn) return;
+
+  if (animation.start == LED_SEGMENTS[TURN_RIGHT].start) {
+    strip.setPixelColor(LED_RIGHT_INDICATOR, strip.Color(255, 100, 0));
+  }
+
+  if (animation.start == LED_SEGMENTS[TURN_LEFT].start) {
+    strip.setPixelColor(LED_LEFT_INDICATOR, strip.Color(255, 100, 0));
+  }
+}
+
+
 
 void clearStripPart(int start, int end)
 {
@@ -355,7 +407,7 @@ int dualAnalogRead(int pinA, int pinB, int number)
     pinMode(pinA, OUTPUT);
     digitalWrite(pinA, LOW);
     pinMode(pinB, INPUT_PULLUP);
-    int rb = analogRead(pinB);
+    int rb = analogRead(pinB); 
 
     pinMode(pinB, OUTPUT);
     digitalWrite(pinB, LOW);
@@ -365,4 +417,39 @@ int dualAnalogRead(int pinA, int pinB, int number)
     resistance += (ra + rb) / 2;
   }
   return resistance / number;
+}
+
+// -----------------------------
+// Zipper → brightness function
+// -----------------------------
+uint8_t readZipperBrightness() {
+  static float filtered = 0;
+  static int lastStable = 0;
+  static bool initialized = false;
+
+  int raw = analogRead(ZIPPER_PIN);
+
+  // Initialize filter on first run
+  if (!initialized) {
+    filtered = raw;
+    lastStable = raw;
+    initialized = true;
+  }
+
+  // Exponential moving average
+  filtered = ALPHA * raw + (1.0 - ALPHA) * filtered;
+  int f = (int)(filtered + 0.5);
+
+  // Deadband / hysteresis
+  if (abs(f - lastStable) < DEADBAND) {
+    f = lastStable;
+  } else {
+    lastStable = f;
+  }
+
+  // Clamp to calibrated range
+  f = constrain(f, ZIPPER_CLOSED, ZIPPER_OPEN);
+
+  // Map: closed → 255, open → 0
+  return (uint8_t)map(f, ZIPPER_CLOSED, ZIPPER_OPEN, 255, 0);
 }
